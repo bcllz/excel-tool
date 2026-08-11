@@ -12,6 +12,10 @@ on:
     branches: [main, master]
   workflow_dispatch:  # 允许手动触发
 
+# 给 Release 步骤写权限
+permissions:
+  contents: write
+
 jobs:
   build-windows:
     runs-on: windows-latest
