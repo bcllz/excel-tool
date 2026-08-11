@@ -1,0 +1,77 @@
+# ============================================================
+# Excel 百宝箱 — Windows EXE 自动构建
+# ============================================================
+# 每次推送代码到 main 分支时，自动用 PyInstaller 打包成
+# Windows 单文件 .exe，并上传为 GitHub Release。
+# ============================================================
+
+name: 打包 Windows EXE
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:  # 允许手动触发
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: 📥 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 🐍 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 📦 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install streamlit pandas openpyxl pyinstaller
+
+      - name: 🔨 打包成 EXE
+        run: |
+          pyinstaller `
+            --onefile `
+            --console `
+            --name "Excel百宝箱" `
+            --add-data "app.py;." `
+            --add-data "requirements.txt;." `
+            --hidden-import streamlit `
+            --hidden-import streamlit.web.cli `
+            --hidden-import pandas `
+            --hidden-import openpyxl `
+            --hidden-import numpy `
+            --hidden-import altair `
+            --hidden-import pyarrow `
+            --hidden-import tornado `
+            --hidden-import jinja2 `
+            --hidden-import rich `
+            --hidden-import gitpython `
+            --collect-all streamlit `
+            --collect-all tornado `
+            --collect-all altair `
+            run.py
+
+      - name: 📁 打包发布文件
+        run: |
+          mkdir release
+          copy dist\Excel百宝箱.exe release\
+          copy README.md release\使用说明.md
+
+      - name: ⬆️ 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: Excel百宝箱-Windows
+          path: release\
+
+      - name: 🚀 发布到 Release
+        uses: softprops/action-gh-release@v2
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+        with:
+          name: Excel百宝箱-Windows-最新版
+          files: release/*
+          tag_name: v${{ github.run_number }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
