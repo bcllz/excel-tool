@@ -1,7 +1,7 @@
 """
 Excel 百宝箱 — 智能自动化处理工具
 =====================================
-基于 Streamlit 的 Excel 处理 Web 应用，共 10 个功能，分 3 大分类。
+基于 Streamlit 的 Excel 处理 Web 应用，共 13 个功能，分 4 大分类。
 所有数据在内存中处理，不上传/保存任何用户文件到服务器。
 """
 
@@ -257,17 +257,73 @@ def do_conditional_format(
 # ---------------------------------------------------------------------------
 # 新功能 3：数据匹配对比
 # ---------------------------------------------------------------------------
+def _norm_key(s: pd.Series) -> pd.Series:
+    """把键列归一化成规范化字符串，解决文本/数字混存导致的匹配失败。
+
+    例：文本 '47676274230' 与数字 47676274230 会被统一成 '47676274230'。
+    """
+    def _to_str(v):
+        if pd.isna(v):
+            return v
+        if isinstance(v, float):
+            # 浮点整数（如 123.0）去掉 .0，避免转成 '123.0'
+            return str(int(v)) if v.is_integer() else str(v)
+        if isinstance(v, (int, np.integer)):
+            return str(v)
+        return str(v).strip()
+    return s.map(_to_str)
+
+
 def do_match(
     df1: pd.DataFrame, df2: pd.DataFrame,
     col1: str, col2: str, how: str
-) -> pd.DataFrame:
-    """两张表按指定列匹配（类似 VLOOKUP）。"""
-    # 给右表的列加后缀避免重名
-    result = df1.merge(
-        df2, left_on=col1, right_on=col2,
+) -> tuple[pd.DataFrame, str, pd.DataFrame, pd.DataFrame]:
+    """两张表按指定列匹配（类 VLOOKUP），键列自动做类型归一化。
+
+    返回 (结果表, 提示信息, 左表未匹配清单, 右表未匹配清单)。
+    提示信息非空表示两列原始格式不一致、已自动统一。
+    """
+    t1, t2 = df1[col1].dtype, df2[col2].dtype
+
+    # 用临时键列承载归一化后的值，避免污染原列
+    key_left, key_right = "__match_key_left__", "__match_key_right__"
+    d1, d2 = df1.copy(), df2.copy()
+    d1[key_left] = _norm_key(df1[col1])
+    d2[key_right] = _norm_key(df2[col2])
+
+    # 归一化前/后 能匹配上的行数（用内连接统计，不受 how 影响）
+    try:
+        before = df1.merge(
+            df2, left_on=col1, right_on=col2, how="inner"
+        ).shape[0]
+    except Exception:
+        before = 0
+    after = d1.merge(
+        d2, left_on=key_left, right_on=key_right, how="inner"
+    ).shape[0]
+
+    # 用归一化键做最终匹配（按用户选的 how）
+    result = d1.merge(
+        d2, left_on=key_left, right_on=key_right,
         how=how, suffixes=("_左表", "_右表")
     )
-    return result
+    result = result.drop(columns=[key_left, key_right], errors="ignore")
+
+    # 未匹配清单：左表有、右表没有 与 右表有、左表没有
+    right_keys = set(d2[key_right].dropna())
+    left_keys = set(d1[key_left].dropna())
+    unmatched_left = d1[~d1[key_left].isin(right_keys)].drop(columns=[key_left])
+    unmatched_right = d2[~d2[key_right].isin(left_keys)].drop(columns=[key_right])
+
+    # 生成提示：格式不一致，或归一化后多匹配上了行
+    note = ""
+    if str(t1) != str(t2):
+        note = (f"⚠️ 两列格式不同（主表「{col1}」={t1}，"
+                f"对照表「{col2}」={t2}），已自动统一为文本后匹配")
+    if after > before:
+        extra = after - before
+        note += ("" if note == "" else "；") + f"归一化后多匹配上 {extra} 行"
+    return result, note, unmatched_left, unmatched_right
 
 # ---------------------------------------------------------------------------
 # 新功能 4：透视汇总
@@ -522,6 +578,278 @@ def df_to_excel(df: pd.DataFrame) -> io.BytesIO:
     out.seek(0)
     return out
 
+
+def dfs_to_excel(sheets: dict[str, pd.DataFrame]) -> io.BytesIO:
+    """多张 DataFrame 写进一个 xlsx（每个 key 一个 Sheet）。"""
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine="openpyxl") as w:
+        for name, d in sheets.items():
+            d.to_excel(w, index=False, sheet_name=str(name)[:31])
+    out.seek(0)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 新功能：列类型体检 + 一键统一
+# ---------------------------------------------------------------------------
+def _coltype_stat(s: pd.Series) -> dict:
+    """统计一列里 数字 / 文本数字 / 其他文本 / 空 的个数。"""
+    n_num = n_textnum = n_text = n_nan = 0
+    for v in s:
+        if pd.isna(v):
+            n_nan += 1
+            continue
+        if isinstance(v, (int, float, np.integer, np.floating)):
+            n_num += 1
+        else:
+            sv = str(v).strip()
+            if sv == "":
+                n_nan += 1
+            elif sv.replace(".", "", 1).isdigit():
+                n_textnum += 1
+            else:
+                n_text += 1
+    return {"数字": n_num, "文本数字": n_textnum, "其他文本": n_text, "空": n_nan}
+
+
+def do_colcheck(df: pd.DataFrame, column: str, target: str) -> tuple[pd.DataFrame, str]:
+    """列类型体检：统计 + 一键统一成目标格式。
+
+    target: "文本数字→数字" / "全部→文本" / "全部→数字(非数字置空)"
+    """
+    s = df[column]
+    stat = _coltype_stat(s)
+    summary = (f"体检：{stat['数字']} 个数字 · {stat['文本数字']} 个文本数字 · "
+               f"{stat['其他文本']} 个其他文本 · {stat['空']} 个空")
+
+    df = df.copy()
+    if target == "文本数字→数字":
+        # 只把纯数字文本转成数字，其余保持原样（保留混合列）
+        def _conv(v):
+            if pd.isna(v):
+                return v
+            if isinstance(v, str):
+                sv = v.strip()
+                if sv == "":
+                    return np.nan
+                if sv.replace(".", "", 1).isdigit():
+                    return float(sv) if "." in sv else int(sv)
+            return v
+        df[column] = s.map(_conv)
+        msg = summary + f" → 已把 {stat['文本数字']} 个文本数字转成真数字"
+    elif target == "全部→文本":
+        df[column] = s.map(lambda v: "" if pd.isna(v) else str(v).strip())
+        msg = summary + " → 已全部转为文本"
+    elif target == "全部→数字(非数字置空)":
+        n_conv = 0
+        def _to_num(v):
+            nonlocal n_conv
+            if pd.isna(v):
+                return np.nan
+            if isinstance(v, (int, float, np.integer, np.floating)):
+                return v
+            sv = str(v).strip()
+            try:
+                r = float(sv)
+                n_conv += 1
+                return r
+            except ValueError:
+                return np.nan
+        df[column] = s.map(_to_num)
+        msg = summary + f" → 已转数字，{n_conv} 个文本被转换，非数字已置空"
+    else:
+        msg = summary
+    return df, msg
+
+
+# ---------------------------------------------------------------------------
+# 新功能：字段回填（从对照表带回指定列）
+# ---------------------------------------------------------------------------
+def do_lookup(
+    df1: pd.DataFrame, df2: pd.DataFrame,
+    col1: str, col2: str, bring_cols: list[str]
+) -> tuple[pd.DataFrame, str]:
+    """按键列匹配，把对照表选中的列回填到主表（left join，键自动归一化）。"""
+    key_left, key_right = "__lookup_key_left__", "__lookup_key_right__"
+    d1, d2 = df1.copy(), df2.copy()
+    d1[key_left] = _norm_key(df1[col1])
+    d2[key_right] = _norm_key(df2[col2])
+
+    # 只取对照表要带回的列（匹配键列不重复带回），避免列名冲突时污染
+    keep = [c for c in bring_cols if c != col2]
+    d2 = d2[[key_right] + keep].drop_duplicates(subset=[key_right], keep="first")
+
+    result = d1.merge(d2, left_on=key_left, right_on=key_right, how="left")
+    result = result.drop(columns=[key_left, key_right])
+
+    # 回填后统计命中率
+    hit = result[bring_cols].notna().any(axis=1).sum()
+    msg = (f"✅ 回填 {len(bring_cols)} 列：{len(d1)} 行中 {hit} 行匹配到对照表"
+           f"（命中率 {hit/max(len(d1),1)*100:.0f}%）")
+    return result, msg
+
+
+# ---------------------------------------------------------------------------
+# 新功能：无损修改（XML 级改列类型，保留公式/透视表/格式）
+# ---------------------------------------------------------------------------
+def _get_sheet_file_map(xl_bytes: bytes) -> tuple[dict, "zipfile.ZipFile"]:
+    """解析 xlsx，返回 (sheet名→sheetN.xml路径, 打开的 ZipFile 读句柄)。"""
+    import re
+    import xml.etree.ElementTree as ET
+    zf = zipfile.ZipFile(io.BytesIO(xl_bytes))
+    wb_xml = zf.read("xl/workbook.xml").decode("utf-8")
+    rels = zf.read("xl/_rels/workbook.xml.rels").decode("utf-8")
+
+    ns = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    rel_map = {}
+    rroot = ET.fromstring(rels)
+    for rel in rroot:
+        rid = rel.get("Id")
+        target = rel.get("Target")
+        if target and "worksheet" in target:
+            # Target 可能是 '/xl/worksheets/sheet1.xml'（openpyxl）或
+            # 'worksheets/sheet1.xml'（Excel/WPS），统一成 zip 内路径
+            t = target.lstrip("/")
+            if not t.startswith("xl/"):
+                t = "xl/" + t
+            rel_map[rid] = t
+    root = ET.fromstring(wb_xml)
+    name2file = {}
+    for sh in root.findall("m:sheets/m:sheet", ns):
+        name = sh.get("name")
+        rid = sh.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
+        if rid in rel_map:
+            name2file[name] = rel_map[rid]
+    return name2file, zf
+
+
+def do_lossless(xl_bytes: bytes, sheet: str, column: str) -> tuple[io.BytesIO, str]:
+    """无损修改：把某 sheet 某列里的「纯数字文本」转成真数字。
+
+    直接在 xlsx 内部 XML 上改，公式/透视表/格式/其他 sheet 全部原样保留。
+    同时兼容两种字符串存储：sharedStrings（Excel/WPS 导出）与 inlineStr（openpyxl 等生成）。
+    column 形如 'A' / 'B' / 'H'。
+    """
+    import re
+    import html
+    import xml.etree.ElementTree as ET
+
+    name2file, zf = _get_sheet_file_map(xl_bytes)
+    if sheet not in name2file:
+        raise ValueError(f"找不到 sheet「{sheet}」")
+
+    sheet_path = name2file[sheet]
+    sheet_xml = zf.read(sheet_path).decode("utf-8")
+
+    # 尝试读共享字符串（可能不存在——openpyxl 等库用 inlineStr）
+    strings = None
+    try:
+        shared = zf.read("xl/sharedStrings.xml").decode("utf-8")
+        ns = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+        sroot = ET.fromstring(shared)
+        strings = []
+        for si in sroot.findall("m:si", ns):
+            texts = si.findall(".//m:t", ns)
+            strings.append("".join(t.text or "" for t in texts))
+    except KeyError:
+        strings = None
+
+    converted = []
+
+    # 1) sharedString 单元格：<c r="A2" ... t="s"><v>idx</v></c>
+    if strings is not None:
+        col_re_s = re.compile(
+            r'<c r="' + re.escape(column) + r'(\d+)"([^>]*t="s"[^>]*)>'
+            r'(<v>(\d+)</v>)</c>'
+        )
+        def repl_s(m):
+            attrs = m.group(2)
+            idx = int(m.group(4))
+            if idx < len(strings) and strings[idx].strip().isdigit():
+                converted.append(strings[idx].strip())
+                newattrs = attrs.replace('t="s"', '')
+                return '<c r="%s%s"%s><v>%d</v></c>' % (
+                    column, m.group(1), newattrs, int(strings[idx].strip()))
+            return m.group(0)
+        sheet_xml = col_re_s.sub(repl_s, sheet_xml)
+
+    # 2) inlineStr 单元格：<c r="A2" ... t="inlineStr"><is><t>text</t></is></c>
+    col_re_i = re.compile(
+        r'<c r="' + re.escape(column) + r'(\d+)"([^>]*t="inlineStr"[^>]*)>'
+        r'<is><t[^>]*>(.*?)</t></is></c>',
+        re.S
+    )
+    def repl_i(m):
+        attrs = m.group(2)
+        text = html.unescape(m.group(3))
+        if text.strip().isdigit():
+            converted.append(text.strip())
+            newattrs = attrs.replace('t="inlineStr"', '')
+            return '<c r="%s%s"%s><v>%d</v></c>' % (
+                column, m.group(1), newattrs, int(text.strip()))
+        return m.group(0)
+    sheet_xml = col_re_i.sub(repl_i, sheet_xml)
+
+    n = len(converted)
+    if n == 0:
+        msg = f"「{sheet}」{column} 列没有需要转换的纯数字文本，文件未变"
+        return io.BytesIO(xl_bytes), msg
+
+    # 重新打包：只替换改动的 sheet XML
+    out = io.BytesIO()
+    zin = zipfile.ZipFile(io.BytesIO(xl_bytes), "r")
+    zout = zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED)
+    for item in zin.infolist():
+        data = zin.read(item.filename)
+        if item.filename == sheet_path:
+            data = sheet_xml.encode("utf-8")
+        zout.writestr(item, data)
+    zin.close()
+    zout.close()
+    out.seek(0)
+    msg = f"「{sheet}」{column} 列：{n} 个文本数字已无损转为真数字（公式/格式/透视表保留）"
+    return out, msg
+
+
+def _get_sheet_headers(xl_bytes: bytes, sheet: str) -> dict[str, str]:
+    """解析某 sheet 的第一行表头，返回 {列字母: 表头文本}。兼容 sharedString/inlineStr。"""
+    import re
+    import html
+    import xml.etree.ElementTree as ET
+
+    name2file, zf = _get_sheet_file_map(xl_bytes)
+    if sheet not in name2file:
+        return {}
+    sheet_xml = zf.read(name2file[sheet]).decode("utf-8")
+
+    strings = None
+    try:
+        shared = zf.read("xl/sharedStrings.xml").decode("utf-8")
+        ns = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+        sroot = ET.fromstring(shared)
+        strings = []
+        for si in sroot.findall("m:si", ns):
+            texts = si.findall(".//m:t", ns)
+            strings.append("".join(t.text or "" for t in texts))
+    except KeyError:
+        strings = None
+
+    row1 = re.search(r'<row r="1"[^>]*>(.*?)</row>', sheet_xml, re.S)
+    result = {}
+    if not row1:
+        return result
+    body = row1.group(1)
+
+    # sharedString 表头
+    for cm in re.finditer(r'<c r="([A-Z]+)1"[^>]*t="s"[^>]*><v>(\d+)</v>', body):
+        letter, idx = cm.group(1), int(cm.group(2))
+        if strings and idx < len(strings):
+            result[letter] = strings[idx]
+    # inlineStr 表头
+    for cm in re.finditer(r'<c r="([A-Z]+)1"[^>]*t="inlineStr"[^>]*><is><t[^>]*>(.*?)</t></is>', body, re.S):
+        result[cm.group(1)] = html.unescape(cm.group(2))
+    return result
+
 # ---------------------------------------------------------------------------
 # 通用：考勤模板生成
 # ---------------------------------------------------------------------------
@@ -594,7 +922,7 @@ def make_attendance_template() -> io.BytesIO:
 st.markdown(
     """<div class="main-header">
         <h1>📊 Excel 百宝箱</h1>
-        <p>上传 → 选功能 → 一键处理 → 下载 · 隐私安全 · 纯内存运算 · 10 大功能</p>
+        <p>上传 → 选功能 → 一键处理 → 下载 · 隐私安全 · 纯内存运算 · 13 大功能</p>
     </div>""",
     unsafe_allow_html=True,
 )
@@ -612,6 +940,7 @@ CATEGORIES = {
         "merge":  ("🔗 数据合并", "多文件纵向拼接为总表"),
         "filter": ("🎯 数据筛选", "按条件过滤行（大于/包含/为空等）"),
         "match":  ("🔗 匹配对比", "两张表按列关联（类 VLOOKUP）"),
+        "lookup": ("🔗 字段回填", "从对照表带回指定列（VLOOKUP 补全）"),
     },
     "📈 分析汇总": {
         "pivot":  ("📐 透视汇总", "按类别求和/平均/计数"),
@@ -621,6 +950,10 @@ CATEGORIES = {
     "📋 办公模板": {
         "formula":("🧮 公式列", "新增公式列，Excel 打开自动计算"),
         "attend": ("👔 考勤工资", "打卡数据算迟到/缺勤/实发工资"),
+    },
+    "🧹 数据清洗修复": {
+        "colcheck": ("🩺 列类型体检", "扫某列数字/文本分布，一键统一格式"),
+        "lossless": ("🔧 无损修复", "改列类型但保留公式/透视表/格式"),
     },
 }
 
@@ -681,12 +1014,13 @@ st.markdown('<p class="step-label">📁 第三步：上传文件</p>', unsafe_al
 df = None
 df2 = None
 uploaded_files = []
+raw_bytes = None   # 无损修改功能用的原始文件字节
 
 if cur_func == "merge":
     uf = st.file_uploader("上传多个 Excel 文件（可多选）", type=["xlsx", "xls"],
                           accept_multiple_files=True, key="upload")
     uploaded_files = uf or []
-elif cur_func == "match":
+elif cur_func in ("match", "lookup"):
     c1, c2 = st.columns(2)
     with c1:
         f1 = st.file_uploader("上传主表（左表）", type=["xlsx", "xls"], key="match_left")
@@ -696,6 +1030,11 @@ elif cur_func == "match":
         df = pd.read_excel(f1)
     if f2:
         df2 = pd.read_excel(f2)
+elif cur_func == "lossless":
+    uf = st.file_uploader("上传 Excel 文件（需 .xlsx，将无损修改）",
+                          type=["xlsx"], key="upload_lossless")
+    if uf:
+        raw_bytes = uf.getvalue()
 elif cur_func:
     if cur_func == "attend":
         # 考勤功能额外提供模板下载
@@ -806,7 +1145,71 @@ GUIDES = {
 - 右表（部门表）：E001技术部 / E003产品部 / E006市场部
 - 按员工ID → left 匹配 → 张三=技术部，李四=没匹配上，赵六=没匹配上
 
-**⚠️ 注意：** 如果两边列名不同也没关系，分别选就行。
+**🆕 输出包含 3 个 Sheet：**
+- **匹配结果** — 关联后的总表
+- **左表未匹配** — 左表有、但右表没有的行（帮你定位缺了谁）
+- **右表未匹配** — 右表有、但左表没有的行
+
+**⚠️ 注意：**
+- 两边列名不同没关系，分别选就行
+- 两列格式不同（一边数字一边文本）会自动统一，不用担心匹配不上
+""",
+    "lookup": """
+### 🔗 字段回填 — 怎么用？
+
+**干什么：** 从对照表把某些列「搬」到主表里，就像 VLOOKUP 补全。比如主表只有「账号ID」，对照表有「账号ID+门店+运营者」→ 一键把门店、运营者回填到主表。
+
+**三步搞定：**
+1. 📁 左边上传主表，右边上传对照表
+2. 🔗 分别选两边的匹配列（ID 列）
+3. ☑️ 勾选要带回的列（可多选，比如「门店」「运营者」）
+4. 🚀 点执行 → 下载补全后的主表
+
+**💡 举个栗子：**
+- 主表：账号ID 47676274230（缺门店、缺运营者）
+- 对照表：账号ID 47676274230 + 门店=红星店 + 运营者=曾婷
+- 选带回「门店」「运营者」→ 主表自动补上这两列
+
+**⚠️ 注意：**
+- 主表所有行都会保留，匹配不上的那行回填列为空
+- 对照表同一个 ID 有多行时，只取第一条
+""",
+    "colcheck": """
+### 🩺 列类型体检 — 怎么用？
+
+**干什么：** 检查某列是不是「数字」「文本」混着存。混着存会导致 VLOOKUP 匹配不上、去重去不掉——先体检再处理，能少踩很多坑。
+
+**三步搞定：**
+1. 📁 上传 Excel 文件
+2. 🔽 选要检查的列 → 会显示「X 个数字 · Y 个文本数字 · Z 个空」
+3. 🎯 选统一方式：
+   - **文本数字→数字**（推荐）：只把 `'123'` 这种纯数字文本转成真数字，其他不动
+   - **全部→文本**：整列变文字
+   - **全部→数字**：非数字的会变成空（慎用）
+4. 🚀 点执行 → 下载清洗后的表
+
+**💡 举个栗子：**
+一列抖音号，8 个是数字、200 个是文本 `'47676274230'` → 选「文本数字→数字」→ 全部变真数字，VLOOKUP 就能匹配上了。
+
+**⚠️ 注意：** 这是「读进内存再导出」，会**丢失原表的公式和透视表**。要保留公式格式，请用「🔧 无损修复」。
+""",
+    "lossless": """
+### 🔧 无损修复 — 怎么用？
+
+**干什么：** 把某列的「纯数字文本」转成真数字，但**保留原表的一切**——公式、透视表、颜色格式、其他 Sheet 全都不动。适合修复带 VLOOKUP 公式的日报表。
+
+**三步搞定：**
+1. 📁 上传 .xlsx 文件
+2. 🔽 选要修的 Sheet → 选要修的列（会显示该列表头，如「A · 抖音号」）
+3. 🚀 点执行 → 下载修复后的原文件
+
+**💡 举个栗子：**
+直播表「区域」列是 `=VLOOKUP(抖音号, 核心表, ...)`，但抖音号一列是文本、核心表是数字，全显示「未归属」→ 无损修复把抖音号转成真数字，公式保留、自动匹配上。
+
+**⚠️ 注意：**
+- 只支持 .xlsx（.xls 老格式不支持）
+- 只转「纯数字」的文本，`CF8834978` 这种含字母的保持文本不动
+- 下载后打开如果公式没重算，按 Ctrl+Alt+F9 强制重算
 """,
     "pivot": """
 ### 📐 透视汇总 — 怎么用？
@@ -1008,11 +1411,72 @@ elif cur_func == "match":
         with c3:
             m_how = st.selectbox("匹配方式：", ["left", "inner", "right", "outer"],
                                  help="left=保留左表全部 | inner=只保留匹配上的 | outer=都保留")
-        st.info(f"将按「{m_col1}」↔「{m_col2}」进行 {m_how} 匹配")
+        st.info(f"将按「{m_col1}」↔「{m_col2}」进行 {m_how} 匹配，并输出未匹配清单")
         st.caption(f"📋 主表：{df.shape[0]}行×{df.shape[1]}列 | 对照表：{df2.shape[0]}行×{df2.shape[1]}列")
         params_ok = True
     else:
         st.info("👆 请在右侧分别上传主表和对照表")
+
+# ---- 字段回填 ----
+elif cur_func == "lookup":
+    if df is not None and df2 is not None:
+        c1, c2 = st.columns(2)
+        with c1:
+            lk_col1 = st.selectbox("主表匹配列：", df.columns.tolist(), key="lkcol1")
+        with c2:
+            lk_col2 = st.selectbox("对照表匹配列：", df2.columns.tolist(), key="lkcol2")
+        # 可带回的列 = 对照表除匹配列外的所有列
+        bring_options = [c for c in df2.columns.tolist() if c != lk_col2]
+        lk_bring = st.multiselect("要带回的列（可多选）：", bring_options,
+                                  default=bring_options[:1] if bring_options else [])
+        if lk_bring:
+            st.info(f"按「{lk_col1}」↔「{lk_col2}」匹配，回填 {len(lk_bring)} 列到主表")
+            params_ok = True
+        st.caption(f"📋 主表：{df.shape[0]}行×{df.shape[1]}列 | 对照表：{df2.shape[0]}行×{df2.shape[1]}列")
+    else:
+        st.info("👆 请在右侧分别上传主表和对照表")
+
+# ---- 列类型体检 ----
+elif cur_func == "colcheck":
+    if df is not None:
+        all_cols = df.columns.tolist()
+        cc_col = st.selectbox("要检查的列：", all_cols)
+        stat = _coltype_stat(df[cc_col])
+        st.info(
+            f"🩺 {cc_col}：{stat['数字']} 个数字 · {stat['文本数字']} 个文本数字 · "
+            f"{stat['其他文本']} 个其他文本 · {stat['空']} 个空"
+        )
+        cc_target = st.radio(
+            "统一方式：",
+            ["文本数字→数字", "全部→文本", "全部→数字(非数字置空)"],
+            horizontal=True,
+            help="文本数字→数字：只把'123'转成真数字，其他不动（推荐）",
+        )
+        params_ok = True
+        st.caption(f"📋 数据：{df.shape[0]} 行 × {df.shape[1]} 列")
+    else:
+        st.info("👆 请先上传文件")
+
+# ---- 无损修复 ----
+elif cur_func == "lossless":
+    if raw_bytes is not None:
+        try:
+            name2file, _zf = _get_sheet_file_map(raw_bytes)
+            sheet_names = list(name2file.keys())
+            ll_sheet = st.selectbox("要修的 Sheet：", sheet_names)
+            col_labels = _get_sheet_headers(raw_bytes, ll_sheet)
+            ll_options = {f"{L} · {t}" if t else f"{L}": L for L, t in col_labels.items() if L}
+            if not ll_options:
+                st.warning("没能解析到该 Sheet 的表头，请确认第一行是列名")
+            else:
+                ll_pick = st.selectbox("要修的列：", list(ll_options.keys()))
+                ll_col = ll_options[ll_pick]
+                st.info(f"将把「{ll_pick}」列里的纯数字文本无损转为真数字")
+                params_ok = True
+        except Exception as e:
+            st.error(f"解析文件失败：{e}")
+    else:
+        st.info("👆 请先上传 .xlsx 文件")
 
 # ---- 透视汇总 ----
 elif cur_func == "pivot":
@@ -1192,8 +1656,9 @@ if exec_clicked and cur_func and params_ok:
     success_msg = ""
     func_cn = {
         "dedup": "去重", "split": "拆分", "merge": "合并", "filter": "筛选",
-        "match": "匹配", "pivot": "透视", "summary": "汇总", "condfmt": "条件格式",
-        "formula": "公式列", "attend": "考勤工资",
+        "match": "匹配", "lookup": "回填", "pivot": "透视", "summary": "汇总",
+        "condfmt": "条件格式", "formula": "公式列", "attend": "考勤工资",
+        "colcheck": "列类型体检", "lossless": "无损修复",
     }
     prefix = func_cn.get(cur_func, "结果")
 
@@ -1226,11 +1691,36 @@ if exec_clicked and cur_func and params_ok:
                 result_bytes = df_to_excel(rdf)
                 success_msg = f"✅ 筛选完成：{len(rdf)} 行满足条件（从 {len(df)} 行中）"
 
-            # --- 匹配 ---
+            # --- 匹配（含未匹配清单） ---
             elif cur_func == "match":
-                rdf = do_match(df, df2, m_col1, m_col2, m_how)
-                result_bytes = df_to_excel(rdf)
+                rdf, m_note, un_left, un_right = do_match(df, df2, m_col1, m_col2, m_how)
+                sheets = {"匹配结果": rdf}
+                if len(un_left):
+                    sheets[f"左表未匹配({len(un_left)})"] = un_left
+                if len(un_right):
+                    sheets[f"右表未匹配({len(un_right)})"] = un_right
+                result_bytes = dfs_to_excel(sheets)
                 success_msg = f"✅ 匹配完成：{len(rdf)} 行 × {rdf.shape[1]} 列"
+                success_msg += f"\n\n左表未匹配 {len(un_left)} 行，右表未匹配 {len(un_right)} 行"
+                if m_note:
+                    success_msg += f"\n\n{m_note}"
+
+            # --- 字段回填 ---
+            elif cur_func == "lookup":
+                rdf, lk_msg = do_lookup(df, df2, lk_col1, lk_col2, lk_bring)
+                result_bytes = df_to_excel(rdf)
+                success_msg = lk_msg
+
+            # --- 列类型体检 ---
+            elif cur_func == "colcheck":
+                rdf, cc_msg = do_colcheck(df, cc_col, cc_target)
+                result_bytes = df_to_excel(rdf)
+                success_msg = cc_msg
+
+            # --- 无损修复 ---
+            elif cur_func == "lossless":
+                result_bytes, ll_msg = do_lossless(raw_bytes, ll_sheet, ll_col)
+                success_msg = ll_msg
 
             # --- 透视 ---
             elif cur_func == "pivot":
@@ -1316,15 +1806,18 @@ if not cur_func:
     | | 🔗 合并 | 多文件拼成总表 |
     | | 🎯 筛选 | 按条件过滤数据 |
     | | 🔗 匹配 | 两张表 VLOOKUP |
+    | | 🔗 回填 | 从对照表补列 |
     | 📈 分析汇总 | 📐 透视 | 分类求和/平均 |
     | | 📋 汇总 | 分组小计+合计 |
     | | 🎨 条件格式 | 高亮标记单元格 |
     | 📋 办公模板 | 🧮 公式列 | 添加 Excel 公式 |
     | | 👔 考勤工资 | 打卡→迟到→工资 |
+    | 🧹 数据清洗修复 | 🩺 列类型体检 | 扫格式分布，一键统一 |
+    | | 🔧 无损修复 | 改列类型，保留公式/透视表 |
 
     👆 请在上方选择一个分类和功能开始使用
     """)
 
 st.divider()
 st.caption("🔒 所有处理均在浏览器内存中完成，不会保存您的任何数据到服务器。")
-st.caption(f"Excel 百宝箱 · 10 项功能 · Powered by Streamlit · {datetime.now().year}")
+st.caption(f"Excel 百宝箱 · 13 项功能 · Powered by Streamlit · {datetime.now().year}")
