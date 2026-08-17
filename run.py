@@ -3,15 +3,20 @@ Excel 百宝箱 — 桌面启动器
 =========================
 双击 exe 后启动 Streamlit 服务并自动打开浏览器。
 兼容 PyInstaller 打包和直接运行两种模式。
+
+【重要】Streamlit 1.50 的 server 是在【当前进程】内用 asyncio 跑的，
+不需要、也不应该用 subprocess 再起子进程。
+打包成 exe 后 sys.executable 指向 exe 自己，subprocess 会变成
+「exe 自己启动自己」的无限递归，表现为不停地弹出浏览器标签页。
+所以这里直接调用 streamlit.web.bootstrap.run()，在当前进程内启动。
 """
 
 import os
 import sys
 import time
 import socket
-import webbrowser
-import subprocess
 import threading
+import webbrowser
 
 
 def find_free_port(start=8501):
@@ -28,7 +33,7 @@ def find_free_port(start=8501):
 def main():
     # ---------- 确定 app.py 位置 ----------
     if getattr(sys, "frozen", False):
-        # PyInstaller 打包后：sys._MEIPASS 是解压目录
+        # PyInstaller 打包后：sys._MEIPASS 是解压出来的资源目录
         base_dir = sys._MEIPASS
     else:
         base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -43,7 +48,7 @@ def main():
 
     port = find_free_port(8501)
 
-    # ---------- 启动 Streamlit ----------
+    # ---------- 启动前提示 ----------
     print("=" * 50)
     print("  📊 Excel 百宝箱 — 正在启动...")
     print("=" * 50)
@@ -53,47 +58,28 @@ def main():
     print("  ⚠️ 请勿关闭此窗口，关闭即停止程序。")
     print("=" * 50)
 
-    # 用线程启动 streamlit
-    def run_streamlit():
-        # PyInstaller 打包后 sys.executable 指向 exe 自身
-        # 需要特殊处理：如果是 frozen，用打包内的 Python
-        if getattr(sys, "frozen", False):
-            # 打包模式下使用 bootstrap 启动
-            streamlit_args = [
-                sys.executable,
-                "-c",
-                f"import sys; sys.argv = ['streamlit', 'run', {app_path!r}, "
-                f"'--server.port', '{port}', '--server.headless', 'true', "
-                f"'--browser.serverAddress', 'localhost']; "
-                "from streamlit.web import cli; cli.main()",
-            ]
-        else:
-            # 开发模式
-            streamlit_args = [
-                sys.executable, "-m", "streamlit", "run", app_path,
-                "--server.port", str(port),
-                "--server.headless", "true",
-            ]
+    # ---------- 延迟打开浏览器（等服务起来再开，只开一次）----------
+    def open_browser_later():
+        time.sleep(5)
+        webbrowser.open(f"http://localhost:{port}")
 
-        subprocess.run(streamlit_args)
+    threading.Thread(target=open_browser_later, daemon=True).start()
 
-    server_thread = threading.Thread(target=run_streamlit, daemon=True)
-    server_thread.start()
+    # ---------- 直接在当前进程内启动 Streamlit（不要再起子进程）----------
+    from streamlit import config as st_config
+    from streamlit.web import bootstrap
 
-    # 等 3 秒让服务启动
-    time.sleep(3)
+    # headless=True：不让 streamlit 自己弹浏览器，由上面的线程统一开
+    st_config.set_option("server.port", port)
+    st_config.set_option("server.headless", True)
+    st_config.set_option("browser.serverAddress", "localhost")
+    st_config.set_option("server.runOnSave", False)
+    st_config.set_option("server.fileWatcherType", "none")  # 避免 watchdog 依赖问题
 
-    # 打开浏览器
-    webbrowser.open(f"http://localhost:{port}")
+    bootstrap.run(app_path, is_hello=False, args=[], flag_options={})
 
-    # 保持主线程存活
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print("\n\n  👋 已停止，感谢使用 Excel 百宝箱！")
-        print("  按任意键关闭窗口...")
-        input()
+    print()
+    print("  👋 已停止，感谢使用 Excel 百宝箱！")
 
 
 if __name__ == "__main__":
