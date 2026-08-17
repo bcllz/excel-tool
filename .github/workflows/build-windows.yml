@@ -36,12 +36,20 @@ jobs:
 
       - name: 🔨 打包成 EXE
         run: |
+          # 动态获取 streamlit 的 static / runtime 目录（前端资源，必须显式打包）
+          $stStatic = python -c "import streamlit, os; print(os.path.join(os.path.dirname(streamlit.__file__), 'static'))"
+          $stRuntime = python -c "import streamlit, os; print(os.path.join(os.path.dirname(streamlit.__file__), 'runtime'))"
+          Write-Host "static dir: $stStatic"
+          Write-Host "runtime dir: $stRuntime"
           pyinstaller `
             --onefile `
             --console `
             --name "Excel百宝箱" `
             --add-data "app.py;." `
             --add-data "requirements.txt;." `
+            --add-data "$stStatic;streamlit/static" `
+            --add-data "$stRuntime;streamlit/runtime" `
+            --copy-metadata streamlit `
             --hidden-import streamlit `
             --hidden-import streamlit.web.cli `
             --hidden-import pandas `
